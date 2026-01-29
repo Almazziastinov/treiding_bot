@@ -170,8 +170,53 @@ def analyze(symbol):
     return None
 
 # ================== BACKGROUND JOBS ==================
-async def run_analysis(context: ContextTypes.DEFAULT_TYPE):
+async def monitor_open_trades(context: ContextTypes.DEFAULT_TYPE):
+    logging.info("Monitoring open trades...")
+    try:
+        with open(CSV_FILE, 'r', newline='') as f:
+            trades = list(csv.reader(f))
+        if not trades or len(trades) <= 1: return
+    except (FileNotFoundError, StopIteration):
+        return
+
+    open_trades = [row for row in trades[1:] if row[7] == "OPEN"]
+    if not open_trades: 
+        logging.info("No open trades to monitor.")
+        return
+
+    for trade in open_trades:
+        date, symbol, side, entry, sl, tp1, tp2, result = trade
+        price = get_current_price(symbol)
+        if price is None: continue
+
+        sl, tp1 = float(sl), float(tp1)
+        trade_closed, new_result = False, ""
+
+        logging.info(f"[Monitor] Checking {symbol} ({side}) | Price: {price:.4f}, SL: {sl:.4f}, TP: {tp1:.4f}")
+
+        if side == "LONG" and (price <= sl or price >= tp1):
+            trade_closed = True
+            new_result = "WIN" if price >= tp1 else "LOSS"
+        elif side == "SHORT" and (price >= sl or price <= tp1):
+            trade_closed = True
+            new_result = "WIN" if price <= tp1 else "LOSS"
+
+        if trade_closed:
+            update_trade(symbol, new_result)
+            message = (f"<b>Trade Closed for {symbol}</b>\n\n"
+                       f"<b>Result:</b> {new_result}\n"
+                       f"<b>Side:</b> {side}\n"
+                       f"<b>Entry Price:</b> {entry}\n"
+                       f"<b>Closing Price:</b> {price:.4f}")
+            logging.info(f"Closing trade for {symbol}. Result: {new_result}")
+            for chat_id in context.job.data.get("chat_ids", []):
+                await context.bot.send_message(chat_id=chat_id, text=message, parse_mode='HTML')
+
+async def run_analysis_and_monitoring(context: ContextTypes.DEFAULT_TYPE):
+    """A single job that runs analysis and then monitors trades."""
     if not CONFIG["ENABLED"]: return
+    
+    # Part 1: Analysis
     logging.info("Running periodic analysis for symbols...")
     for symbol in SYMBOLS:
         try:
@@ -191,44 +236,9 @@ async def run_analysis(context: ContextTypes.DEFAULT_TYPE):
                     await context.bot.send_message(chat_id=chat_id, text=signal_message, parse_mode='HTML')
         except Exception as e:
             logging.error(f"Error during analysis of {symbol}: {e}")
-
-async def monitor_open_trades(context: ContextTypes.DEFAULT_TYPE):
-    logging.info("Monitoring open trades...")
-    try:
-        with open(CSV_FILE, 'r', newline='') as f:
-            trades = list(csv.reader(f))
-        if not trades or len(trades) <= 1: return
-    except (FileNotFoundError, StopIteration):
-        return
-
-    open_trades = [row for row in trades[1:] if row[7] == "OPEN"]
-    if not open_trades: return
-
-    for trade in open_trades:
-        date, symbol, side, entry, sl, tp1, tp2, result = trade
-        price = get_current_price(symbol)
-        if price is None: continue
-
-        sl, tp1 = float(sl), float(tp1)
-        trade_closed, new_result = False, ""
-
-        if side == "LONG" and (price <= sl or price >= tp1):
-            trade_closed = True
-            new_result = "WIN" if price >= tp1 else "LOSS"
-        elif side == "SHORT" and (price >= sl or price <= tp1):
-            trade_closed = True
-            new_result = "WIN" if price <= tp1 else "LOSS"
-
-        if trade_closed:
-            update_trade(symbol, new_result)
-            message = (f"<b>Trade Closed for {symbol}</b>\n\n"
-                       f"<b>Result:</b> {new_result}\n"
-                       f"<b>Side:</b> {side}\n"
-                       f"<b>Entry Price:</b> {entry}\n"
-                       f"<b>Closing Price:</b> {price:.4f}")
-            logging.info(f"Closing trade for {symbol}. Result: {new_result}")
-            for chat_id in context.job.data.get("chat_ids", []):
-                await context.bot.send_message(chat_id=chat_id, text=message, parse_mode='HTML')
+            
+    # Part 2: Monitoring
+    await monitor_open_trades(context)
 
 # ================== TELEGRAM COMMAND HANDLERS ==================
 def restricted(func):
@@ -338,8 +348,8 @@ def main():
     application = ApplicationBuilder().token(token).build()
     job_queue = application.job_queue
 
-    job_queue.run_repeating(run_analysis, interval=60, first=10, data={"chat_ids": ALLOWED_CHAT_IDS})
-    job_queue.run_repeating(monitor_open_trades, interval=60, first=15, data={"chat_ids": ALLOWED_CHAT_IDS})
+    # A single job now runs both analysis and monitoring
+    job_queue.run_repeating(run_analysis_and_monitoring, interval=60, first=10, data={"chat_ids": ALLOWED_CHAT_IDS})
 
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('risk', risk))
@@ -349,7 +359,7 @@ def main():
     application.add_handler(CommandHandler('off', off))
     application.add_handler(CommandHandler('status', status))
     application.add_handler(CommandHandler('stats', stats))
-    application.add_handler(CommandHandler('winrate', winrate)) # Add new command handler
+    application.add_handler(CommandHandler('winrate', winrate))
 
     print("Bot is running... Press Ctrl-C to stop.")
     application.run_polling()
