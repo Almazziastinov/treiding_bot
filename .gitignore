@@ -1,0 +1,14 @@
+# Virtual Environment
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# User data and generated files
+trades.csv
+bingx_futures_symbols.txt
+get_symbols.py
