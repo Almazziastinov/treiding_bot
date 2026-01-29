@@ -132,18 +132,23 @@ def analyze(symbol):
     ema50, ema200 = ema(closes, 50), ema(closes, 200)
     if ema50 is None or ema200 is None or not quality_filter(closes, vols, highs, lows): return None
     signal_data = None
+    
+    # --- Setup 1: Retest ---
     resistance_level = max(highs[-20:-3])
     if (ema50 > ema200 and closes[-3] > resistance_level and lows[-2] <= resistance_level and closes[-2] > resistance_level and closes[-1] > closes[-2]):
         price = closes[-1]
         sl = min(lows[-5:]) * 0.99
         tp1, tp2 = price + (price - sl) * 2, price * (1 + CONFIG["TP_FIXED"]/100)
         signal_data = ("LONG", price, sl, tp1, tp2, (resistance_level, price))
+
     support_level = min(lows[-20:-3])
     if not signal_data and (ema50 < ema200 and closes[-3] < support_level and highs[-2] >= support_level and closes[-2] < support_level and closes[-1] < closes[-2]):
         price = closes[-1]
         sl = max(highs[-5:]) * 1.01
         tp1, tp2 = price - (sl - price) * 2, price * (1 - CONFIG["TP_FIXED"]/100)
         signal_data = ("SHORT", price, sl, tp1, tp2, (price, support_level))
+
+    # --- Setup 2: EMA/FVG Collision ---
     if not signal_data:
         fvg_info = find_fvg(highs, lows)
         if fvg_info:
@@ -152,13 +157,15 @@ def analyze(symbol):
             if fvg_low < ema200 < fvg_high and abs(price - ema200) / price < 0.001:
                 entry_range = (fvg_low, fvg_high)
                 if fvg_type == 'BULLISH' and price > ema200:
-                    sl = fvg_low * 0.99
+                    sl = min(lows[-5:]) * 0.99  # CORRECTED SL
                     tp1, tp2 = price + (price - sl) * 2, price * (1 + CONFIG["TP_FIXED"]/100)
                     signal_data = ("LONG", price, sl, tp1, tp2, entry_range)
                 elif fvg_type == 'BEARISH' and price < ema200:
-                    sl = fvg_high * 1.01
+                    sl = max(highs[-5:]) * 1.01  # CORRECTED SL
                     tp1, tp2 = price - (sl - price) * 2, price * (1 - CONFIG["TP_FIXED"]/100)
                     signal_data = ("SHORT", price, sl, tp1, tp2, entry_range)
+
+    # --- Final Check: OB Confirmation (Enhancer) ---
     if signal_data:
         ob_confirmed = False
         ob_info = find_confirmed_ob(closes, highs, lows, vols)
@@ -167,6 +174,7 @@ def analyze(symbol):
             entry_price = signal_data[1]
             if ob_low <= entry_price <= ob_high: ob_confirmed = True
         return signal_data + (ob_confirmed,)
+        
     return None
 
 # ================== BACKGROUND JOBS ==================
