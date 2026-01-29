@@ -45,28 +45,39 @@ def log_trade(row):
 
 def update_trade(symbol, result):
     rows = []
-    with open(CSV_FILE, newline="") as f:
-        rows = list(csv.reader(f))
-    for i in range(len(rows) - 1, 0, -1):
-        if rows[i][1] == symbol and rows[i][-1] == "OPEN":
-            rows[i][-1] = result
-            break
-    with open(CSV_FILE, "w", newline="") as f:
-        csv.writer(f).writerows(rows)
+    try:
+        with open(CSV_FILE, 'r', newline='') as f:
+            rows = list(csv.reader(f))
+        
+        for i in range(len(rows) - 1, 0, -1):
+            if rows[i][1] == symbol and rows[i][7] == "OPEN":
+                rows[i][7] = result
+                break
+        
+        with open(CSV_FILE, 'w', newline='') as f:
+            csv.writer(f).writerows(rows)
+    except FileNotFoundError:
+        logging.error("trades.csv not found while trying to update trade.")
 
 # ================== MARKET & INDICATORS ==================
 def get_klines(symbol, limit=300):
     url = "https://open-api.bingx.com/openApi/swap/v2/quote/klines"
     try:
-        r = requests.get(url, params={
-            "symbol": symbol,
-            "interval": CONFIG["TIMEFRAME"],
-            "limit": limit
-        }, timeout=10).json()
-        return r["data"] if r.get("code") == 0 else []
+        r = requests.get(url, params={"symbol": symbol, "interval": CONFIG["TIMEFRAME"], "limit": limit}, timeout=10).json()
+        return r.get("data", []) if r.get("code") == 0 else []
     except requests.RequestException as e:
         logging.error(f"Error fetching klines for {symbol}: {e}")
         return []
+
+def get_current_price(symbol):
+    url = "https://open-api.bingx.com/openApi/swap/v2/quote/price"
+    try:
+        r = requests.get(url, params={"symbol": symbol}, timeout=5).json()
+        if r.get("code") == 0 and 'data' in r and 'price' in r['data']:
+            return float(r['data']['price'])
+    except (requests.RequestException, KeyError, ValueError) as e:
+        logging.error(f"Could not fetch current price for {symbol}: {e}")
+    return None
 
 def ema(data, period):
     if len(data) < period: return None
@@ -103,50 +114,37 @@ def find_fvg(highs, lows):
 def find_confirmed_ob(closes, highs, lows, volumes, lookback=15, confirmation_multiplier=1.5):
     if len(closes) < lookback + 5: return None
     avg_volume = np.mean(volumes[-lookback:])
-    # Search for a Bullish OB (last red candle before an up-move)
     for i in range(-3, -lookback, -1):
         if closes[i] < closes[i-1] and closes[i+1] > closes[i]:
             for j in range(i + 1, min(i + 4, 0)):
-                if volumes[j] > avg_volume * confirmation_multiplier:
-                    return (lows[i], highs[i])
-    # Search for a Bearish OB (last green candle before a down-move)
+                if volumes[j] > avg_volume * confirmation_multiplier: return (lows[i], highs[i])
     for i in range(-3, -lookback, -1):
         if closes[i] > closes[i-1] and closes[i+1] < closes[i]:
             for j in range(i + 1, min(i + 4, 0)):
-                if volumes[j] > avg_volume * confirmation_multiplier:
-                    return (lows[i], highs[i])
+                if volumes[j] > avg_volume * confirmation_multiplier: return (lows[i], highs[i])
     return None
 
 # ================== STRATEGY & ANALYSIS ==================
 def analyze(symbol):
     k = get_klines(symbol)
     if len(k) < 250: return None
-
     closes = [float(x['close']) for x in k]
     highs, lows, vols = [float(x['high']) for x in k], [float(x['low']) for x in k], [float(x['volume']) for x in k]
     ema50, ema200 = ema(closes, 50), ema(closes, 200)
-
-    if ema50 is None or ema200 is None or not quality_filter(closes, vols, highs, lows):
-        return None
-
+    if ema50 is None or ema200 is None or not quality_filter(closes, vols, highs, lows): return None
     signal_data = None
-
-    # --- Setup 1: Retest ---
     resistance_level = max(highs[-20:-3])
     if (ema50 > ema200 and closes[-3] > resistance_level and lows[-2] <= resistance_level and closes[-2] > resistance_level and closes[-1] > closes[-2]):
         price = closes[-1]
         sl = min(lows[-5:]) * 0.99
         tp1, tp2 = price + (price - sl) * 2, price * (1 + CONFIG["TP_FIXED"]/100)
         signal_data = ("LONG", price, sl, tp1, tp2, (resistance_level, price))
-
     support_level = min(lows[-20:-3])
     if not signal_data and (ema50 < ema200 and closes[-3] < support_level and highs[-2] >= support_level and closes[-2] < support_level and closes[-1] < closes[-2]):
         price = closes[-1]
         sl = max(highs[-5:]) * 1.01
         tp1, tp2 = price - (sl - price) * 2, price * (1 - CONFIG["TP_FIXED"]/100)
         signal_data = ("SHORT", price, sl, tp1, tp2, (price, support_level))
-
-    # --- Setup 2: EMA/FVG Collision ---
     if not signal_data:
         fvg_info = find_fvg(highs, lows)
         if fvg_info:
@@ -162,21 +160,17 @@ def analyze(symbol):
                     sl = fvg_high * 1.01
                     tp1, tp2 = price - (sl - price) * 2, price * (1 - CONFIG["TP_FIXED"]/100)
                     signal_data = ("SHORT", price, sl, tp1, tp2, entry_range)
-
-    # --- Final Check: OB Confirmation (Enhancer) ---
     if signal_data:
         ob_confirmed = False
         ob_info = find_confirmed_ob(closes, highs, lows, vols)
         if ob_info:
             ob_low, ob_high = ob_info
             entry_price = signal_data[1]
-            if ob_low <= entry_price <= ob_high:
-                ob_confirmed = True
+            if ob_low <= entry_price <= ob_high: ob_confirmed = True
         return signal_data + (ob_confirmed,)
-
     return None
 
-# ================== BACKGROUND JOB ==================
+# ================== BACKGROUND JOBS ==================
 async def run_analysis(context: ContextTypes.DEFAULT_TYPE):
     if not CONFIG["ENABLED"]: return
     logging.info("Running periodic analysis for symbols...")
@@ -185,24 +179,57 @@ async def run_analysis(context: ContextTypes.DEFAULT_TYPE):
             signal_data = analyze(symbol)
             if signal_data:
                 side, price, sl, tp1, tp2, entry_range, ob_confirmed = signal_data
-                
-                signal_message = (
-                    f"<b>New Signal for {symbol}</b>\n\n"
-                    f"<b>Side:</b> {side}\n"
-                    f"<b>Entry Range:</b> {entry_range[0]:.4f} - {entry_range[1]:.4f}\n"
-                    f"<b>Entry Price:</b> {price:.4f}\n"
-                    f"<b>Stop Loss:</b> {sl:.4f}\n"
-                    f"<b>Take Profit 1:</b> {tp1:.4f}\n"
-                    f"<b>Take Profit 2:</b> {tp2:.4f}"
-                )
-                if ob_confirmed:
-                    signal_message += "\n<b>Confirmation:</b> ✅ OB Confirmed"
-                
+                signal_message = (f"<b>New Signal for {symbol}</b>\n\n"
+                                  f"<b>Side:</b> {side}\n"
+                                  f"<b>Entry Range:</b> {entry_range[0]:.4f} - {entry_range[1]:.4f}\n"
+                                  f"<b>Entry Price:</b> {price:.4f}\n"
+                                  f"<b>Stop Loss:</b> {sl:.4f}\n"
+                                  f"<b>Take Profit 1:</b> {tp1:.4f}\n"
+                                  f"<b>Take Profit 2:</b> {tp2:.4f}")
+                if ob_confirmed: signal_message += "\n<b>Confirmation:</b> ✅ OB Confirmed"
                 log_trade([datetime.now().strftime('%Y-%m-%d %H:%M'), symbol, side, price, sl, tp1, tp2, "OPEN"])
                 for chat_id in context.job.data.get("chat_ids", []):
                     await context.bot.send_message(chat_id=chat_id, text=signal_message, parse_mode='HTML')
         except Exception as e:
             logging.error(f"Error during analysis of {symbol}: {e}")
+
+async def monitor_open_trades(context: ContextTypes.DEFAULT_TYPE):
+    logging.info("Monitoring open trades...")
+    try:
+        with open(CSV_FILE, 'r', newline='') as f:
+            trades = list(csv.reader(f))
+        if not trades or len(trades) <= 1: return
+    except (FileNotFoundError, StopIteration):
+        return
+
+    open_trades = [row for row in trades[1:] if row[7] == "OPEN"]
+    if not open_trades: return
+
+    for trade in open_trades:
+        date, symbol, side, entry, sl, tp1, tp2, result = trade
+        price = get_current_price(symbol)
+        if price is None: continue
+
+        sl, tp1 = float(sl), float(tp1)
+        trade_closed, new_result = False, ""
+
+        if side == "LONG" and (price <= sl or price >= tp1):
+            trade_closed = True
+            new_result = "WIN" if price >= tp1 else "LOSS"
+        elif side == "SHORT" and (price >= sl or price <= tp1):
+            trade_closed = True
+            new_result = "WIN" if price <= tp1 else "LOSS"
+
+        if trade_closed:
+            update_trade(symbol, new_result)
+            message = (f"<b>Trade Closed for {symbol}</b>\n\n"
+                       f"<b>Result:</b> {new_result}\n"
+                       f"<b>Side:</b> {side}\n"
+                       f"<b>Entry Price:</b> {entry}\n"
+                       f"<b>Closing Price:</b> {price:.4f}")
+            logging.info(f"Closing trade for {symbol}. Result: {new_result}")
+            for chat_id in context.job.data.get("chat_ids", []):
+                await context.bot.send_message(chat_id=chat_id, text=message, parse_mode='HTML')
 
 # ================== TELEGRAM COMMAND HANDLERS ==================
 def restricted(func):
@@ -268,6 +295,40 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except FileNotFoundError:
         await update.message.reply_text("Trade log file not found.")
 
+@restricted
+async def winrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        with open(CSV_FILE, 'r', newline='') as f:
+            reader = csv.reader(f)
+            header = next(reader)
+            closed_trades = [row for row in reader if row[7] != "OPEN"]
+    except (FileNotFoundError, StopIteration):
+        await update.message.reply_text("Trade log file not found or is empty.")
+        return
+
+    if not closed_trades:
+        await update.message.reply_text("No closed trades found to calculate winrate.")
+        return
+
+    wins = sum(1 for trade in closed_trades if trade[7] == "WIN")
+    losses = sum(1 for trade in closed_trades if trade[7] == "LOSS")
+    total_closed = wins + losses
+
+    if total_closed == 0:
+        await update.message.reply_text("No trades with WIN/LOSS status found.")
+        return
+
+    win_rate = (wins / total_closed) * 100
+
+    message = (
+        f"<b>Trade Performance</b>\n\n"
+        f"Total Closed Trades: {total_closed}\n"
+        f"Wins: {wins}\n"
+        f"Losses: {losses}\n"
+        f"<b>Winrate: {win_rate:.2f}%</b>"
+    )
+    await update.message.reply_html(message)
+
 # ================== MAIN ==================
 def main():
     token = os.getenv("BOT_TOKEN")
@@ -277,7 +338,9 @@ def main():
 
     application = ApplicationBuilder().token(token).build()
     job_queue = application.job_queue
+
     job_queue.run_repeating(run_analysis, interval=60, first=10, data={"chat_ids": ALLOWED_CHAT_IDS})
+    job_queue.run_repeating(monitor_open_trades, interval=60, first=15, data={"chat_ids": ALLOWED_CHAT_IDS})
 
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('risk', risk))
@@ -287,6 +350,7 @@ def main():
     application.add_handler(CommandHandler('off', off))
     application.add_handler(CommandHandler('status', status))
     application.add_handler(CommandHandler('stats', stats))
+    application.add_handler(CommandHandler('winrate', winrate)) # Add new command handler
 
     print("Bot is running... Press Ctrl-C to stop.")
     application.run_polling()
