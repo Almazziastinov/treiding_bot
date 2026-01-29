@@ -22,14 +22,11 @@ CONFIG = {
     "TP_FIXED": 4,   # +4%
     "ENABLED": True
 }
-SYMBOLS = []
-SYMBOLS_FILE = "bingx_futures_symbols.txt"
-try:
-    with open(SYMBOLS_FILE, 'r') as f:
-        SYMBOLS = [line.strip() for line in f if line.strip()]
-    logging.info(f"Successfully loaded {len(SYMBOLS)} symbols from {SYMBOLS_FILE}.")
-except FileNotFoundError:
-    logging.error(f"Symbols file not found: {SYMBOLS_FILE}. The bot will not analyze any symbols.")
+SYMBOLS = [
+    "DOGE-USDT", "WIF-USDT", "TURBO-USDT", "ORDI-USDT", "NEAR-USDT", 
+    "ENA-USDT", "1000PEPE-USDT", "POPCAT-USDT", "PNUT-USDT", "ACT-USDT"
+]
+logging.info(f"Using a curated list of {len(SYMBOLS)} symbols.")
 CSV_FILE = "trades.csv"
 
 # ================== CSV ==================
