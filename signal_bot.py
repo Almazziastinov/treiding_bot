@@ -105,7 +105,7 @@ def quality_filter(closes, volumes, highs, lows):
 # ================== ANALYZE ==================
 def analyze(symbol):
     k = get_klines(symbol)
-    if len(k) < 200:
+    if len(k) < 25: # Increased lookback for retest logic
         return None
 
     closes = [float(x['close']) for x in k]
@@ -119,21 +119,35 @@ def analyze(symbol):
     if ema50 is None or ema200 is None:
         return None
 
-    price = closes[-1]
-    high = max(highs[-20:])
-    low = min(lows[-20:])
-
     if not quality_filter(closes, vols, highs, lows):
         return None
 
-    if ema50 > ema200 and closes[-2] > high:
-        sl = low * 0.99
+    # --- New Retest Logic ---
+    
+    # LONG Retest of Resistance
+    resistance_level = max(highs[-20:-3]) # Find resistance in a recent period
+    if (ema50 > ema200 and                  # 1. Trend is up
+        closes[-3] > resistance_level and   # 2. Breakout candle
+        lows[-2] <= resistance_level and    # 3. Retest candle touches the level
+        closes[-2] > resistance_level and   # 4. Retest candle holds the level
+        closes[-1] > closes[-2]):           # 5. Confirmation candle moves up
+        
+        price = closes[-1]
+        sl = min(lows[-5:]) * 0.99 # Place SL below recent lows
         tp1 = price + (price - sl) * 2
         tp2 = price * (1 + CONFIG["TP_FIXED"]/100)
         return "LONG", price, sl, tp1, tp2
 
-    if ema50 < ema200 and closes[-2] < low:
-        sl = high * 1.01
+    # SHORT Retest of Support
+    support_level = min(lows[-20:-3]) # Find support in a recent period
+    if (ema50 < ema200 and                    # 1. Trend is down
+        closes[-3] < support_level and      # 2. Breakdown candle
+        highs[-2] >= support_level and      # 3. Retest candle touches the level
+        closes[-2] < support_level and      # 4. Retest candle holds the level
+        closes[-1] < closes[-2]):           # 5. Confirmation candle moves down
+        
+        price = closes[-1]
+        sl = max(highs[-5:]) * 1.01 # Place SL above recent highs
         tp1 = price - (sl - price) * 2
         tp2 = price * (1 - CONFIG["TP_FIXED"]/100)
         return "SHORT", price, sl, tp1, tp2
