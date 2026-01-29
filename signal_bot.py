@@ -56,7 +56,7 @@ def update_trade(symbol, result):
     with open(CSV_FILE, "w", newline="") as f:
         csv.writer(f).writerows(rows)
 
-# ================== MARKET ==================
+# ================== MARKET & INDICATORS ==================
 def get_klines(symbol, limit=300):
     url = "https://open-api.bingx.com/openApi/swap/v2/quote/klines"
     try:
@@ -89,6 +89,7 @@ def atr(highs, lows, closes, period=14):
 
 def quality_filter(closes, volumes, highs, lows):
     try:
+        if len(closes) < 21 or len(volumes) < 21: return False
         atr_val = atr(highs, lows, closes)
         avg_range = np.mean([h - l for h, l in zip(highs[-20:], lows[-20:])])
         impulse = abs(closes[-1] - closes[-2])
@@ -102,19 +103,31 @@ def quality_filter(closes, volumes, highs, lows):
         logging.error(f"Error in quality_filter: {e}")
         return False
 
-# ================== ANALYZE ==================
+def find_fvg(highs, lows):
+    # Looks for the most recent FVG in the last 15 candles
+    for i in range(-3, -15, -1):
+        # Bullish FVG: Gap between high of candle i and low of candle i-2
+        if highs[i] < lows[i-2]:
+            return ('BULLISH', highs[i], lows[i-2])
+        # Bearish FVG: Gap between low of candle i and high of candle i-2
+        if lows[i] > highs[i-2]:
+            return ('BEARISH', highs[i-2], lows[i])
+    return None
+
+# ================== STRATEGY & ANALYSIS ==================
 def analyze(symbol):
     k = get_klines(symbol)
-    if len(k) < 25: # Increased lookback for retest logic
+    if len(k) < 250:
         return None
 
+    # --- 1. Data & Indicator Preparation ---
     closes = [float(x['close']) for x in k]
     highs  = [float(x['high']) for x in k]
     lows   = [float(x['low']) for x in k]
     vols   = [float(x['volume']) for x in k]
 
-    ema50 = ema(closes[-100:], 50)
-    ema200 = ema(closes[-250:], 200)
+    ema50 = ema(closes, 50)
+    ema200 = ema(closes, 200)
 
     if ema50 is None or ema200 is None:
         return None
@@ -122,35 +135,53 @@ def analyze(symbol):
     if not quality_filter(closes, vols, highs, lows):
         return None
 
-    # --- New Retest Logic ---
-    
-    # LONG Retest of Resistance
-    resistance_level = max(highs[-20:-3]) # Find resistance in a recent period
-    if (ema50 > ema200 and                  # 1. Trend is up
-        closes[-3] > resistance_level and   # 2. Breakout candle
-        lows[-2] <= resistance_level and    # 3. Retest candle touches the level
-        closes[-2] > resistance_level and   # 4. Retest candle holds the level
-        closes[-1] > closes[-2]):           # 5. Confirmation candle moves up
+    # --- 2. Check for "Retest" Setup ---
+    resistance_level = max(highs[-20:-3])
+    if (ema50 > ema200 and closes[-3] > resistance_level and 
+        lows[-2] <= resistance_level and closes[-2] > resistance_level and 
+        closes[-1] > closes[-2]):
         
         price = closes[-1]
-        sl = min(lows[-5:]) * 0.99 # Place SL below recent lows
+        sl = min(lows[-5:]) * 0.99
         tp1 = price + (price - sl) * 2
         tp2 = price * (1 + CONFIG["TP_FIXED"]/100)
-        return "LONG", price, sl, tp1, tp2
+        entry_range = (resistance_level, price)
+        return "LONG", price, sl, tp1, tp2, entry_range
 
-    # SHORT Retest of Support
-    support_level = min(lows[-20:-3]) # Find support in a recent period
-    if (ema50 < ema200 and                    # 1. Trend is down
-        closes[-3] < support_level and      # 2. Breakdown candle
-        highs[-2] >= support_level and      # 3. Retest candle touches the level
-        closes[-2] < support_level and      # 4. Retest candle holds the level
-        closes[-1] < closes[-2]):           # 5. Confirmation candle moves down
+    support_level = min(lows[-20:-3])
+    if (ema50 < ema200 and closes[-3] < support_level and 
+        highs[-2] >= support_level and closes[-2] < support_level and 
+        closes[-1] < closes[-2]):
         
         price = closes[-1]
-        sl = max(highs[-5:]) * 1.01 # Place SL above recent highs
+        sl = max(highs[-5:]) * 1.01
         tp1 = price - (sl - price) * 2
         tp2 = price * (1 - CONFIG["TP_FIXED"]/100)
-        return "SHORT", price, sl, tp1, tp2
+        entry_range = (price, support_level)
+        return "SHORT", price, sl, tp1, tp2, entry_range
+
+    # --- 3. If no Retest, check for "EMA/FVG Collision" Setup ---
+    fvg_info = find_fvg(highs, lows)
+    if fvg_info:
+        fvg_type, fvg_low, fvg_high = fvg_info
+        price = closes[-1]
+        
+        is_ema_in_fvg = fvg_low < ema200 < fvg_high
+        is_price_near_ema = abs(price - ema200) / price < 0.001 # 0.1% threshold
+
+        if is_ema_in_fvg and is_price_near_ema:
+            entry_range = (fvg_low, fvg_high)
+            if fvg_type == 'BULLISH' and price > ema200:
+                sl = fvg_low * 0.99
+                tp1 = price + (price - sl) * 2
+                tp2 = price * (1 + CONFIG["TP_FIXED"]/100)
+                return "LONG", price, sl, tp1, tp2, entry_range
+            
+            if fvg_type == 'BEARISH' and price < ema200:
+                sl = fvg_high * 1.01
+                tp1 = price - (sl - price) * 2
+                tp2 = price * (1 - CONFIG["TP_FIXED"]/100)
+                return "SHORT", price, sl, tp1, tp2, entry_range
 
     return None
 
@@ -166,11 +197,12 @@ async def run_analysis(context: ContextTypes.DEFAULT_TYPE):
         try:
             signal_data = analyze(symbol)
             if signal_data:
-                side, price, sl, tp1, tp2 = signal_data
+                side, price, sl, tp1, tp2, entry_range = signal_data
                 
                 signal_message = (
                     f"<b>New Signal for {symbol}</b>\n\n"
                     f"<b>Side:</b> {side}\n"
+                    f"<b>Entry Range:</b> {entry_range[0]:.4f} - {entry_range[1]:.4f}\n"
                     f"<b>Entry Price:</b> {price:.4f}\n"
                     f"<b>Stop Loss:</b> {sl:.4f}\n"
                     f"<b>Take Profit 1:</b> {tp1:.4f}\n"
