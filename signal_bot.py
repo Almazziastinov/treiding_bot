@@ -47,12 +47,10 @@ def update_trade(symbol, result):
     rows = []
     with open(CSV_FILE, newline="") as f:
         rows = list(csv.reader(f))
-
     for i in range(len(rows) - 1, 0, -1):
         if rows[i][1] == symbol and rows[i][-1] == "OPEN":
             rows[i][-1] = result
             break
-
     with open(CSV_FILE, "w", newline="") as f:
         csv.writer(f).writerows(rows)
 
@@ -71,20 +69,14 @@ def get_klines(symbol, limit=300):
         return []
 
 def ema(data, period):
-    if len(data) < period:
-        return None
+    if len(data) < period: return None
     return np.mean(data[-period:])
 
 def atr(highs, lows, closes, period=14):
     trs = []
     for i in range(1, len(closes)):
-        trs.append(max(
-            highs[i] - lows[i],
-            abs(highs[i] - closes[i-1]),
-            abs(lows[i] - closes[i-1])
-        ))
-    if not trs:
-        return 0
+        trs.append(max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1])))
+    if not trs: return 0
     return np.mean(trs[-period:])
 
 def quality_filter(closes, volumes, highs, lows):
@@ -94,7 +86,6 @@ def quality_filter(closes, volumes, highs, lows):
         avg_range = np.mean([h - l for h, l in zip(highs[-20:], lows[-20:])])
         impulse = abs(closes[-1] - closes[-2])
         avg_impulse = np.mean([abs(closes[i] - closes[i-1]) for i in range(-10, -1)])
-
         if atr_val < avg_range * 0.3: return False
         if impulse < avg_impulse * 1.2: return False
         if volumes[-1] < np.mean(volumes[-20:]) * 1.3: return False
@@ -104,100 +95,96 @@ def quality_filter(closes, volumes, highs, lows):
         return False
 
 def find_fvg(highs, lows):
-    # Looks for the most recent FVG in the last 15 candles
     for i in range(-3, -15, -1):
-        # Bullish FVG: Gap between high of candle i and low of candle i-2
-        if highs[i] < lows[i-2]:
-            return ('BULLISH', highs[i], lows[i-2])
-        # Bearish FVG: Gap between low of candle i and high of candle i-2
-        if lows[i] > highs[i-2]:
-            return ('BEARISH', highs[i-2], lows[i])
+        if highs[i] < lows[i-2]: return ('BULLISH', highs[i], lows[i-2])
+        if lows[i] > highs[i-2]: return ('BEARISH', highs[i-2], lows[i])
+    return None
+
+def find_confirmed_ob(closes, highs, lows, volumes, lookback=15, confirmation_multiplier=1.5):
+    if len(closes) < lookback + 5: return None
+    avg_volume = np.mean(volumes[-lookback:])
+    # Search for a Bullish OB (last red candle before an up-move)
+    for i in range(-3, -lookback, -1):
+        if closes[i] < closes[i-1] and closes[i+1] > closes[i]:
+            for j in range(i + 1, min(i + 4, 0)):
+                if volumes[j] > avg_volume * confirmation_multiplier:
+                    return (lows[i], highs[i])
+    # Search for a Bearish OB (last green candle before a down-move)
+    for i in range(-3, -lookback, -1):
+        if closes[i] > closes[i-1] and closes[i+1] < closes[i]:
+            for j in range(i + 1, min(i + 4, 0)):
+                if volumes[j] > avg_volume * confirmation_multiplier:
+                    return (lows[i], highs[i])
     return None
 
 # ================== STRATEGY & ANALYSIS ==================
 def analyze(symbol):
     k = get_klines(symbol)
-    if len(k) < 250:
-        return None
+    if len(k) < 250: return None
 
-    # --- 1. Data & Indicator Preparation ---
     closes = [float(x['close']) for x in k]
-    highs  = [float(x['high']) for x in k]
-    lows   = [float(x['low']) for x in k]
-    vols   = [float(x['volume']) for x in k]
+    highs, lows, vols = [float(x['high']) for x in k], [float(x['low']) for x in k], [float(x['volume']) for x in k]
+    ema50, ema200 = ema(closes, 50), ema(closes, 200)
 
-    ema50 = ema(closes, 50)
-    ema200 = ema(closes, 200)
-
-    if ema50 is None or ema200 is None:
+    if ema50 is None or ema200 is None or not quality_filter(closes, vols, highs, lows):
         return None
 
-    if not quality_filter(closes, vols, highs, lows):
-        return None
+    signal_data = None
 
-    # --- 2. Check for "Retest" Setup ---
+    # --- Setup 1: Retest ---
     resistance_level = max(highs[-20:-3])
-    if (ema50 > ema200 and closes[-3] > resistance_level and 
-        lows[-2] <= resistance_level and closes[-2] > resistance_level and 
-        closes[-1] > closes[-2]):
-        
+    if (ema50 > ema200 and closes[-3] > resistance_level and lows[-2] <= resistance_level and closes[-2] > resistance_level and closes[-1] > closes[-2]):
         price = closes[-1]
         sl = min(lows[-5:]) * 0.99
-        tp1 = price + (price - sl) * 2
-        tp2 = price * (1 + CONFIG["TP_FIXED"]/100)
-        entry_range = (resistance_level, price)
-        return "LONG", price, sl, tp1, tp2, entry_range
+        tp1, tp2 = price + (price - sl) * 2, price * (1 + CONFIG["TP_FIXED"]/100)
+        signal_data = ("LONG", price, sl, tp1, tp2, (resistance_level, price))
 
     support_level = min(lows[-20:-3])
-    if (ema50 < ema200 and closes[-3] < support_level and 
-        highs[-2] >= support_level and closes[-2] < support_level and 
-        closes[-1] < closes[-2]):
-        
+    if not signal_data and (ema50 < ema200 and closes[-3] < support_level and highs[-2] >= support_level and closes[-2] < support_level and closes[-1] < closes[-2]):
         price = closes[-1]
         sl = max(highs[-5:]) * 1.01
-        tp1 = price - (sl - price) * 2
-        tp2 = price * (1 - CONFIG["TP_FIXED"]/100)
-        entry_range = (price, support_level)
-        return "SHORT", price, sl, tp1, tp2, entry_range
+        tp1, tp2 = price - (sl - price) * 2, price * (1 - CONFIG["TP_FIXED"]/100)
+        signal_data = ("SHORT", price, sl, tp1, tp2, (price, support_level))
 
-    # --- 3. If no Retest, check for "EMA/FVG Collision" Setup ---
-    fvg_info = find_fvg(highs, lows)
-    if fvg_info:
-        fvg_type, fvg_low, fvg_high = fvg_info
-        price = closes[-1]
-        
-        is_ema_in_fvg = fvg_low < ema200 < fvg_high
-        is_price_near_ema = abs(price - ema200) / price < 0.001 # 0.1% threshold
+    # --- Setup 2: EMA/FVG Collision ---
+    if not signal_data:
+        fvg_info = find_fvg(highs, lows)
+        if fvg_info:
+            fvg_type, fvg_low, fvg_high = fvg_info
+            price = closes[-1]
+            if fvg_low < ema200 < fvg_high and abs(price - ema200) / price < 0.001:
+                entry_range = (fvg_low, fvg_high)
+                if fvg_type == 'BULLISH' and price > ema200:
+                    sl = fvg_low * 0.99
+                    tp1, tp2 = price + (price - sl) * 2, price * (1 + CONFIG["TP_FIXED"]/100)
+                    signal_data = ("LONG", price, sl, tp1, tp2, entry_range)
+                elif fvg_type == 'BEARISH' and price < ema200:
+                    sl = fvg_high * 1.01
+                    tp1, tp2 = price - (sl - price) * 2, price * (1 - CONFIG["TP_FIXED"]/100)
+                    signal_data = ("SHORT", price, sl, tp1, tp2, entry_range)
 
-        if is_ema_in_fvg and is_price_near_ema:
-            entry_range = (fvg_low, fvg_high)
-            if fvg_type == 'BULLISH' and price > ema200:
-                sl = fvg_low * 0.99
-                tp1 = price + (price - sl) * 2
-                tp2 = price * (1 + CONFIG["TP_FIXED"]/100)
-                return "LONG", price, sl, tp1, tp2, entry_range
-            
-            if fvg_type == 'BEARISH' and price < ema200:
-                sl = fvg_high * 1.01
-                tp1 = price - (sl - price) * 2
-                tp2 = price * (1 - CONFIG["TP_FIXED"]/100)
-                return "SHORT", price, sl, tp1, tp2, entry_range
+    # --- Final Check: OB Confirmation (Enhancer) ---
+    if signal_data:
+        ob_confirmed = False
+        ob_info = find_confirmed_ob(closes, highs, lows, vols)
+        if ob_info:
+            ob_low, ob_high = ob_info
+            entry_price = signal_data[1]
+            if ob_low <= entry_price <= ob_high:
+                ob_confirmed = True
+        return signal_data + (ob_confirmed,)
 
     return None
 
 # ================== BACKGROUND JOB ==================
 async def run_analysis(context: ContextTypes.DEFAULT_TYPE):
-    if not CONFIG["ENABLED"]:
-        return
-
+    if not CONFIG["ENABLED"]: return
     logging.info("Running periodic analysis for symbols...")
-    chat_ids = context.job.data.get("chat_ids", [])
-    
     for symbol in SYMBOLS:
         try:
             signal_data = analyze(symbol)
             if signal_data:
-                side, price, sl, tp1, tp2, entry_range = signal_data
+                side, price, sl, tp1, tp2, entry_range, ob_confirmed = signal_data
                 
                 signal_message = (
                     f"<b>New Signal for {symbol}</b>\n\n"
@@ -208,14 +195,14 @@ async def run_analysis(context: ContextTypes.DEFAULT_TYPE):
                     f"<b>Take Profit 1:</b> {tp1:.4f}\n"
                     f"<b>Take Profit 2:</b> {tp2:.4f}"
                 )
+                if ob_confirmed:
+                    signal_message += "\n<b>Confirmation:</b> ✅ OB Confirmed"
                 
                 log_trade([datetime.now().strftime('%Y-%m-%d %H:%M'), symbol, side, price, sl, tp1, tp2, "OPEN"])
-
-                for chat_id in chat_ids:
+                for chat_id in context.job.data.get("chat_ids", []):
                     await context.bot.send_message(chat_id=chat_id, text=signal_message, parse_mode='HTML')
         except Exception as e:
             logging.error(f"Error during analysis of {symbol}: {e}")
-
 
 # ================== TELEGRAM COMMAND HANDLERS ==================
 def restricted(func):
@@ -235,7 +222,7 @@ async def risk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         new_risk = int(context.args[0])
         CONFIG["RISK"] = new_risk
-        await update.message.reply_text(f"✅ Risk set to: {CONFIG['RISK']}% ")
+        await update.message.reply_text(f"✅ Risk set to: {CONFIG['RISK']}%")
     except (IndexError, ValueError):
         await update.message.reply_text("Usage: /risk <percentage>")
 
@@ -253,7 +240,7 @@ async def tp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         new_tp = int(context.args[0])
         CONFIG["TP_FIXED"] = new_tp
-        await update.message.reply_text(f"🎯 TP2 set to: {CONFIG['TP_FIXED']}% ")
+        await update.message.reply_text(f"🎯 TP2 set to: {CONFIG['TP_FIXED']}%")
     except (IndexError, ValueError):
         await update.message.reply_text("Usage: /tp <percentage>")
 
@@ -289,14 +276,8 @@ def main():
         return
 
     application = ApplicationBuilder().token(token).build()
-
     job_queue = application.job_queue
-    job_queue.run_repeating(
-        run_analysis, 
-        interval=60,
-        first=10,
-        data={"chat_ids": ALLOWED_CHAT_IDS}
-    )
+    job_queue.run_repeating(run_analysis, interval=60, first=10, data={"chat_ids": ALLOWED_CHAT_IDS})
 
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('risk', risk))
