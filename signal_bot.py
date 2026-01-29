@@ -24,7 +24,9 @@ CONFIG = {
 }
 SYMBOLS = [
     "DOGE-USDT", "WIF-USDT", "TURBO-USDT", "ORDI-USDT", "NEAR-USDT", 
-    "ENA-USDT", "1000PEPE-USDT", "POPCAT-USDT", "PNUT-USDT", "ACT-USDT"
+    "ENA-USDT", "1000PEPE-USDT", "POPCAT-USDT", "PNUT-USDT", "ACT-USDT",
+    "BTC-USDT", "ETH-USDT", "SYN-USDT", "STG-USDT", "BCH-USDT", "SOL-USDT", 
+    "XRP-USDT"
 ]
 logging.info(f"Using a curated list of {len(SYMBOLS)} symbols.")
 CSV_FILE = "trades.csv"
