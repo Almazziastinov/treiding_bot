@@ -1,14 +1,10 @@
-# Virtual Environment
 venv/
-.venv/
 
-# Python cache
+# Python
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
 
-# User data and generated files
+# Local files
+История.txt
+*.ipynb
 trades.csv
-bingx_futures_symbols.txt
-get_symbols.py

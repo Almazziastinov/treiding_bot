@@ -23,9 +23,9 @@ CONFIG = {
     "ENABLED": True
 }
 SYMBOLS = [
-    "DOGE-USDT", "WIF-USDT", "TURBO-USDT", "ORDI-USDT", "NEAR-USDT", 
+    "DOGE-USDT", "WIF-USDT", "TURBO-USDT", "ORDI-USDT", "NEAR-USDT",
     "ENA-USDT", "1000PEPE-USDT", "POPCAT-USDT", "PNUT-USDT", "ACT-USDT",
-    "BTC-USDT", "ETH-USDT", "SYN-USDT", "STG-USDT", "BCH-USDT", "SOL-USDT", 
+    "BTC-USDT", "ETH-USDT", "SYN-USDT", "STG-USDT", "BCH-USDT", "SOL-USDT",
     "XRP-USDT"
 ]
 logging.info(f"Using a curated list of {len(SYMBOLS)} symbols.")
@@ -47,12 +47,12 @@ def update_trade(symbol, result):
     try:
         with open(CSV_FILE, 'r', newline='') as f:
             rows = list(csv.reader(f))
-        
+
         for i in range(len(rows) - 1, 0, -1):
             if rows[i][1] == symbol and rows[i][7] == "OPEN":
                 rows[i][7] = result
                 break
-        
+
         with open(CSV_FILE, 'w', newline='') as f:
             csv.writer(f).writerows(rows)
     except FileNotFoundError:
@@ -132,7 +132,7 @@ def analyze(symbol):
     ema50, ema200 = ema(closes, 50), ema(closes, 200)
     if ema50 is None or ema200 is None or not quality_filter(closes, vols, highs, lows): return None
     signal_data = None
-    
+
     # --- Setup 1: Retest ---
     resistance_level = max(highs[-20:-3])
     if (ema50 > ema200 and closes[-3] > resistance_level and lows[-2] <= resistance_level and closes[-2] > resistance_level and closes[-1] > closes[-2]):
@@ -174,7 +174,7 @@ def analyze(symbol):
             entry_price = signal_data[1]
             if ob_low <= entry_price <= ob_high: ob_confirmed = True
         return signal_data + (ob_confirmed,)
-        
+
     return None
 
 # ================== BACKGROUND JOBS ==================
@@ -188,7 +188,7 @@ async def monitor_open_trades(context: ContextTypes.DEFAULT_TYPE):
         return
 
     open_trades = [row for row in trades[1:] if row[7] == "OPEN"]
-    if not open_trades: 
+    if not open_trades:
         logging.info("No open trades to monitor.")
         return
 
@@ -223,7 +223,7 @@ async def monitor_open_trades(context: ContextTypes.DEFAULT_TYPE):
 async def run_analysis_and_monitoring(context: ContextTypes.DEFAULT_TYPE):
     """A single job that runs analysis and then monitors trades."""
     if not CONFIG["ENABLED"]: return
-    
+
     # Part 1: Analysis
     logging.info("Running periodic analysis for symbols...")
     for symbol in SYMBOLS:
@@ -244,7 +244,7 @@ async def run_analysis_and_monitoring(context: ContextTypes.DEFAULT_TYPE):
                     await context.bot.send_message(chat_id=chat_id, text=signal_message, parse_mode='HTML')
         except Exception as e:
             logging.error(f"Error during analysis of {symbol}: {e}")
-            
+
     # Part 2: Monitoring
     await monitor_open_trades(context)
 
