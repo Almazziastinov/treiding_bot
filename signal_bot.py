@@ -373,6 +373,14 @@ async def winrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_html(message)
 
+@restricted
+async def get_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sends the trades.csv file to the user."""
+    try:
+        await update.message.reply_document(document=open(CSV_FILE, 'rb'), filename=CSV_FILE)
+    except FileNotFoundError:
+        await update.message.reply_text("trades.csv file not found.")
+
 # ================== MAIN ==================
 def main():
     token = os.getenv("BOT_TOKEN")
@@ -394,6 +402,7 @@ def main():
     application.add_handler(CommandHandler('status', status))
     application.add_handler(CommandHandler('stats', stats))
     application.add_handler(CommandHandler('winrate', winrate))
+    application.add_handler(CommandHandler('get_csv', get_csv))
 
     print("Bot is running... Press Ctrl-C to stop.")
     application.run_polling()
