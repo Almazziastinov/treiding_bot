@@ -17,10 +17,11 @@ logging.basicConfig(
 # ================== CONFIG & GLOBALS ==================
 ALLOWED_CHAT_IDS = ["842287010", "635124229"]
 CONFIG = {
-    "TIMEFRAME": "15m",
-    "RISK": 10,
-    "TP_FIXED": 4,   # +4%
-    "ENABLED": True
+    "ENABLED": True,
+    "MAX_OPEN_TRADES": 3, # Максимальное количество одновременных сделок
+    "ATR_SL_MULTIPLIER": 1.5, # Множитель ATR для стоп-лосса
+    "RR_TP1": 1.5, # Risk/Reward для TP1
+    "RR_TP2": 3.0  # Risk/Reward для TP2
 }
 SYMBOLS = [
     "DOGE-USDT", "WIF-USDT", "TURBO-USDT", "ORDI-USDT", "NEAR-USDT",
@@ -41,6 +42,18 @@ if not os.path.exists(CSV_FILE):
 def log_trade(row):
     with open(CSV_FILE, "a", newline="") as f:
         csv.writer(f).writerow(row)
+
+def get_open_trades_count():
+    """Возвращает количество открытых сделок из CSV."""
+    try:
+        with open(CSV_FILE, 'r', newline='') as f:
+            trades = list(csv.reader(f))
+        if not trades or len(trades) <= 1:
+            return 0
+        open_trades = [row for row in trades[1:] if row[7] == "OPEN"]
+        return len(open_trades)
+    except (FileNotFoundError, StopIteration):
+        return 0
 
 def update_trade(symbol, result):
     rows = []
@@ -129,41 +142,50 @@ def analyze(symbol):
     if len(k) < 250: return None
     closes = [float(x['close']) for x in k]
     highs, lows, vols = [float(x['high']) for x in k], [float(x['low']) for x in k], [float(x['volume']) for x in k]
+    
     ema50, ema200 = ema(closes, 50), ema(closes, 200)
-    if ema50 is None or ema200 is None or not quality_filter(closes, vols, highs, lows): return None
+    atr_val = atr(highs, lows, closes, period=14)
+
+    if ema50 is None or ema200 is None or atr_val == 0 or not quality_filter(closes, vols, highs, lows):
+        return None
+        
     signal_data = None
+    price = closes[-1]
+    sl_multiplier = CONFIG["ATR_SL_MULTIPLIER"]
+    tp1_rr, tp2_rr = CONFIG["RR_TP1"], CONFIG["RR_TP2"]
 
     # --- Setup 1: Retest ---
     resistance_level = max(highs[-20:-3])
-    if (ema50 > ema200 and closes[-3] > resistance_level and lows[-2] <= resistance_level and closes[-2] > resistance_level and closes[-1] > closes[-2]):
-        price = closes[-1]
-        sl = min(lows[-5:]) * 0.99
-        tp1, tp2 = price + (price - sl) * 2, price * (1 + CONFIG["TP_FIXED"]/100)
-        signal_data = ("LONG", price, sl, tp1, tp2, (resistance_level, price))
+    if (ema50 > ema200 and closes[-1] > ema50 and closes[-3] > resistance_level and lows[-2] <= resistance_level and closes[-2] > resistance_level and closes[-1] > closes[-2]):
+        sl_price = price - (atr_val * sl_multiplier)
+        tp1_price = price + (price - sl_price) * tp1_rr
+        tp2_price = price + (price - sl_price) * tp2_rr
+        signal_data = ("LONG", price, sl_price, tp1_price, tp2_price, (resistance_level, price))
 
     support_level = min(lows[-20:-3])
-    if not signal_data and (ema50 < ema200 and closes[-3] < support_level and highs[-2] >= support_level and closes[-2] < support_level and closes[-1] < closes[-2]):
-        price = closes[-1]
-        sl = max(highs[-5:]) * 1.01
-        tp1, tp2 = price - (sl - price) * 2, price * (1 - CONFIG["TP_FIXED"]/100)
-        signal_data = ("SHORT", price, sl, tp1, tp2, (price, support_level))
+    if not signal_data and (ema50 < ema200 and closes[-1] < ema50 and closes[-3] < support_level and highs[-2] >= support_level and closes[-2] < support_level and closes[-1] < closes[-2]):
+        sl_price = price + (atr_val * sl_multiplier)
+        tp1_price = price - (sl_price - price) * tp1_rr
+        tp2_price = price - (sl_price - price) * tp2_rr
+        signal_data = ("SHORT", price, sl_price, tp1_price, tp2_price, (price, support_level))
 
     # --- Setup 2: EMA/FVG Collision ---
     if not signal_data:
         fvg_info = find_fvg(highs, lows)
         if fvg_info:
             fvg_type, fvg_low, fvg_high = fvg_info
-            price = closes[-1]
-            if fvg_low < ema200 < fvg_high and abs(price - ema200) / price < 0.001:
+            if fvg_low < ema200 < fvg_high and abs(price - ema200) / price < 0.003: # Increased tolerance
                 entry_range = (fvg_low, fvg_high)
                 if fvg_type == 'BULLISH' and price > ema200:
-                    sl = min(lows[-5:]) * 0.99  # CORRECTED SL
-                    tp1, tp2 = price + (price - sl) * 2, price * (1 + CONFIG["TP_FIXED"]/100)
-                    signal_data = ("LONG", price, sl, tp1, tp2, entry_range)
+                    sl_price = price - (atr_val * sl_multiplier)
+                    tp1_price = price + (price - sl_price) * tp1_rr
+                    tp2_price = price + (price - sl_price) * tp2_rr
+                    signal_data = ("LONG", price, sl_price, tp1_price, tp2_price, entry_range)
                 elif fvg_type == 'BEARISH' and price < ema200:
-                    sl = max(highs[-5:]) * 1.01  # CORRECTED SL
-                    tp1, tp2 = price - (sl - price) * 2, price * (1 - CONFIG["TP_FIXED"]/100)
-                    signal_data = ("SHORT", price, sl, tp1, tp2, entry_range)
+                    sl_price = price + (atr_val * sl_multiplier)
+                    tp1_price = price - (sl_price - price) * tp1_rr
+                    tp2_price = price - (sl_price - price) * tp2_rr
+                    signal_data = ("SHORT", price, sl_price, tp1_price, tp2_price, entry_range)
 
     # --- Final Check: OB Confirmation (Enhancer) ---
     if signal_data:
@@ -222,11 +244,25 @@ async def monitor_open_trades(context: ContextTypes.DEFAULT_TYPE):
 
 async def run_analysis_and_monitoring(context: ContextTypes.DEFAULT_TYPE):
     """A single job that runs analysis and then monitors trades."""
-    if not CONFIG["ENABLED"]: return
+    # Part 1: Monitoring (run this first to close trades and free up slots)
+    await monitor_open_trades(context)
 
-    # Part 1: Analysis
+    # Part 2: Analysis
+    if not CONFIG["ENABLED"]:
+        return
+
+    open_trades_count = get_open_trades_count()
+    if open_trades_count >= CONFIG["MAX_OPEN_TRADES"]:
+        logging.info(f"Skipping analysis. Open trades ({open_trades_count}) reached limit ({CONFIG['MAX_OPEN_TRADES']}).")
+        return
+
     logging.info("Running periodic analysis for symbols...")
     for symbol in SYMBOLS:
+        # Re-check limit before each analysis
+        if get_open_trades_count() >= CONFIG["MAX_OPEN_TRADES"]:
+            logging.info(f"Stopping analysis mid-run. Open trades limit reached.")
+            break
+            
         try:
             signal_data = analyze(symbol)
             if signal_data:
@@ -236,17 +272,17 @@ async def run_analysis_and_monitoring(context: ContextTypes.DEFAULT_TYPE):
                                   f"<b>Entry Range:</b> {entry_range[0]:.4f} - {entry_range[1]:.4f}\n"
                                   f"<b>Entry Price:</b> {price:.4f}\n"
                                   f"<b>Stop Loss:</b> {sl:.4f}\n"
-                                  f"<b>Take Profit 1:</b> {tp1:.4f}\n"
-                                  f"<b>Take Profit 2:</b> {tp2:.4f}")
+                                  f"<b>Take Profit 1 (RR {CONFIG['RR_TP1']}:1):</b> {tp1:.4f}\n"
+                                  f"<b>Take Profit 2 (RR {CONFIG['RR_TP2']}:1):</b> {tp2:.4f}")
                 if ob_confirmed: signal_message += "\n<b>Confirmation:</b> ✅ OB Confirmed"
+                
                 log_trade([datetime.now().strftime('%Y-%m-%d %H:%M'), symbol, side, price, sl, tp1, tp2, "OPEN"])
+                
                 for chat_id in context.job.data.get("chat_ids", []):
                     await context.bot.send_message(chat_id=chat_id, text=signal_message, parse_mode='HTML')
         except Exception as e:
             logging.error(f"Error during analysis of {symbol}: {e}")
 
-    # Part 2: Monitoring
-    await monitor_open_trades(context)
 
 # ================== TELEGRAM COMMAND HANDLERS ==================
 def restricted(func):
@@ -266,7 +302,7 @@ async def risk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         new_risk = int(context.args[0])
         CONFIG["RISK"] = new_risk
-        await update.message.reply_text(f"✅ Risk set to: {CONFIG['RISK']}%")
+        await update.message.reply_text(f"✅ Risk set to: {CONFIG['RISK']}% ")
     except (IndexError, ValueError):
         await update.message.reply_text("Usage: /risk <percentage>")
 
@@ -278,15 +314,6 @@ async def timeframe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⏱ Timeframe set to: {CONFIG['TIMEFRAME']}")
     except IndexError:
         await update.message.reply_text("Usage: /tf <timeframe>")
-
-@restricted
-async def tp(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        new_tp = int(context.args[0])
-        CONFIG["TP_FIXED"] = new_tp
-        await update.message.reply_text(f"🎯 TP2 set to: {CONFIG['TP_FIXED']}%")
-    except (IndexError, ValueError):
-        await update.message.reply_text("Usage: /tp <percentage>")
 
 @restricted
 async def on(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -362,7 +389,6 @@ def main():
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('risk', risk))
     application.add_handler(CommandHandler('tf', timeframe))
-    application.add_handler(CommandHandler('tp', tp))
     application.add_handler(CommandHandler('on', on))
     application.add_handler(CommandHandler('off', off))
     application.add_handler(CommandHandler('status', status))
