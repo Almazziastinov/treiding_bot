@@ -18,6 +18,7 @@ logging.basicConfig(
 ALLOWED_CHAT_IDS = ["842287010", "635124229"]
 CONFIG = {
     "ENABLED": True,
+    "TIMEFRAME": "15m", # Таймфрейм по умолчанию
     "MAX_OPEN_TRADES": 3, # Максимальное количество одновременных сделок
     "ATR_SL_MULTIPLIER": 1.5, # Множитель ATR для стоп-лосса
     "RR_TP1": 1.5, # Risk/Reward для TP1
