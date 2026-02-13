@@ -3,7 +3,11 @@ import logging
 import csv
 import numpy as np
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
+import asyncio
+
+# Импортируем наш новый сканер
+import market_scanner
 
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, JobQueue
@@ -19,18 +23,18 @@ ALLOWED_CHAT_IDS = ["842287010", "635124229"]
 CONFIG = {
     "ENABLED": True,
     "TIMEFRAME": "15m", # Таймфрейм по умолчанию
-    "MAX_OPEN_TRADES": 3, # Максимальное количество одновременных сделок
+    "MAX_OPEN_TRADES": 5, # Максимальное количество одновременных сделок
     "ATR_SL_MULTIPLIER": 1.5, # Множитель ATR для стоп-лосса
     "RR_TP1": 1.5, # Risk/Reward для TP1
-    "RR_TP2": 3.0  # Risk/Reward для TP2
+    "RR_TP2": 3.0,  # Risk/Reward для TP2
+    "COOLDOWN_PERIOD_MINUTES": 60, # Период охлаждения для символа в минутах
 }
-SYMBOLS = [
-    "DOGE-USDT", "WIF-USDT", "TURBO-USDT", "ORDI-USDT", "NEAR-USDT",
-    "ENA-USDT", "1000PEPE-USDT", "POPCAT-USDT", "PNUT-USDT", "ACT-USDT",
-    "BTC-USDT", "ETH-USDT", "SYN-USDT", "STG-USDT", "BCH-USDT", "SOL-USDT",
-    "XRP-USDT"
-]
-logging.info(f"Using a curated list of {len(SYMBOLS)} symbols.")
+
+# Глобальный список отслеживаемых монет, обновляется сканером
+WATCHLIST = []
+# Словарь для отслеживания времени последнего сигнала по монете
+SIGNAL_COOLDOWN = {}
+
 CSV_FILE = "trades.csv"
 
 # ================== CSV ==================
@@ -139,6 +143,10 @@ def find_confirmed_ob(closes, highs, lows, volumes, lookback=15, confirmation_mu
 
 # ================== STRATEGY & ANALYSIS ==================
 def analyze(symbol):
+    # --- Новая логика: Отключить SHORT сделки ---
+    # Мы можем сделать это более гибким в будущем, но пока отключаем полностью
+    ALLOW_SHORTS = False
+
     k = get_klines(symbol)
     if len(k) < 250: return None
     closes = [float(x['close']) for x in k]
@@ -155,7 +163,7 @@ def analyze(symbol):
     sl_multiplier = CONFIG["ATR_SL_MULTIPLIER"]
     tp1_rr, tp2_rr = CONFIG["RR_TP1"], CONFIG["RR_TP2"]
 
-    # --- Setup 1: Retest ---
+    # --- Setup 1: Retest (Только LONG) ---
     resistance_level = max(highs[-20:-3])
     if (ema50 > ema200 and closes[-1] > ema50 and closes[-3] > resistance_level and lows[-2] <= resistance_level and closes[-2] > resistance_level and closes[-1] > closes[-2]):
         sl_price = price - (atr_val * sl_multiplier)
@@ -164,13 +172,13 @@ def analyze(symbol):
         signal_data = ("LONG", price, sl_price, tp1_price, tp2_price, (resistance_level, price))
 
     support_level = min(lows[-20:-3])
-    if not signal_data and (ema50 < ema200 and closes[-1] < ema50 and closes[-3] < support_level and highs[-2] >= support_level and closes[-2] < support_level and closes[-1] < closes[-2]):
+    if not signal_data and ALLOW_SHORTS and (ema50 < ema200 and closes[-1] < ema50 and closes[-3] < support_level and highs[-2] >= support_level and closes[-2] < support_level and closes[-1] < closes[-2]):
         sl_price = price + (atr_val * sl_multiplier)
         tp1_price = price - (sl_price - price) * tp1_rr
         tp2_price = price - (sl_price - price) * tp2_rr
         signal_data = ("SHORT", price, sl_price, tp1_price, tp2_price, (price, support_level))
 
-    # --- Setup 2: EMA/FVG Collision ---
+    # --- Setup 2: EMA/FVG Collision (Только LONG) ---
     if not signal_data:
         fvg_info = find_fvg(highs, lows)
         if fvg_info:
@@ -182,7 +190,7 @@ def analyze(symbol):
                     tp1_price = price + (price - sl_price) * tp1_rr
                     tp2_price = price + (price - sl_price) * tp2_rr
                     signal_data = ("LONG", price, sl_price, tp1_price, tp2_price, entry_range)
-                elif fvg_type == 'BEARISH' and price < ema200:
+                elif fvg_type == 'BEARISH' and ALLOW_SHORTS and price < ema200:
                     sl_price = price + (atr_val * sl_multiplier)
                     tp1_price = price - (sl_price - price) * tp1_rr
                     tp2_price = price - (sl_price - price) * tp2_rr
@@ -251,23 +259,41 @@ async def run_analysis_and_monitoring(context: ContextTypes.DEFAULT_TYPE):
     # Part 2: Analysis
     if not CONFIG["ENABLED"]:
         return
+        
+    if not WATCHLIST:
+        logging.warning("Watchlist is empty. Skipping analysis.")
+        return
 
     open_trades_count = get_open_trades_count()
     if open_trades_count >= CONFIG["MAX_OPEN_TRADES"]:
         logging.info(f"Skipping analysis. Open trades ({open_trades_count}) reached limit ({CONFIG['MAX_OPEN_TRADES']}).")
         return
 
-    logging.info("Running periodic analysis for symbols...")
-    for symbol in SYMBOLS:
+    logging.info(f"Running periodic analysis for symbols in watchlist: {WATCHLIST}")
+    # Итерируемся по копии, чтобы избежать проблем с изменением списка во время итерации
+    for symbol in WATCHLIST[:]:
         # Re-check limit before each analysis
         if get_open_trades_count() >= CONFIG["MAX_OPEN_TRADES"]:
             logging.info(f"Stopping analysis mid-run. Open trades limit reached.")
             break
             
+        # --- Новая логика: Проверка "периода охлаждения" ---
+        now = datetime.now()
+        if symbol in SIGNAL_COOLDOWN:
+            last_signal_time = SIGNAL_COOLDOWN[symbol]
+            cooldown_delta = timedelta(minutes=CONFIG["COOLDOWN_PERIOD_MINUTES"])
+            if now - last_signal_time < cooldown_delta:
+                logging.info(f"Symbol {symbol} is in cooldown. Skipping.")
+                continue
+        
         try:
             signal_data = analyze(symbol)
             if signal_data:
                 side, price, sl, tp1, tp2, entry_range, ob_confirmed = signal_data
+                
+                # --- Новая логика: Обновляем время охлаждения ---
+                SIGNAL_COOLDOWN[symbol] = now
+                
                 signal_message = (f"<b>New Signal for {symbol}</b>\n\n"
                                   f"<b>Side:</b> {side}\n"
                                   f"<b>Entry Range:</b> {entry_range[0]:.4f} - {entry_range[1]:.4f}\n"
@@ -283,6 +309,30 @@ async def run_analysis_and_monitoring(context: ContextTypes.DEFAULT_TYPE):
                     await context.bot.send_message(chat_id=chat_id, text=signal_message, parse_mode='HTML')
         except Exception as e:
             logging.error(f"Error during analysis of {symbol}: {e}")
+
+async def update_watchlist_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Асинхронная задача для обновления глобального списка отслеживаемых монет.
+    Запускает ресурсоемкий сканнер в отдельном потоке, чтобы не блокировать бота.
+    """
+    global WATCHLIST
+    logging.info("Job: Starting market scan to update watchlist...")
+    
+    # Запускаем синхронную функцию сканера в отдельном потоке
+    loop = asyncio.get_running_loop()
+    new_watchlist = await loop.run_in_executor(
+        None, market_scanner.scan_top_movers, 20
+    )
+    
+    if new_watchlist:
+        WATCHLIST = new_watchlist
+        logging.info(f"Job: Watchlist updated successfully with {len(WATCHLIST)} symbols.")
+        # Оповещаем администратора об обновлении
+        message = "✅ **Watchlist Updated**\n\n" + "\n".join(WATCHLIST)
+        for chat_id in context.job.data.get("chat_ids", []):
+            await context.bot.send_message(chat_id=chat_id, text=message, parse_mode='Markdown')
+    else:
+        logging.warning("Job: Market scan returned an empty list. Watchlist not updated.")
 
 
 # ================== TELEGRAM COMMAND HANDLERS ==================
@@ -329,7 +379,17 @@ async def off(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @restricted
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_text = "<pre>" + "\n".join([f"{k}: {v}" for k, v in CONFIG.items()]) + "</pre>"
+    status_text += f"\n<b>Watchlist ({len(WATCHLIST)} symbols):</b>\n" + ", ".join(WATCHLIST)
     await update.message.reply_html(status_text)
+
+@restricted
+async def get_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает текущий список отслеживаемых монет."""
+    if WATCHLIST:
+        message = "📄 **Current Watchlist**\n\n" + "\n".join(WATCHLIST)
+    else:
+        message = "Watchlist is currently empty. The scanner might be running."
+    await update.message.reply_text(message, parse_mode='Markdown')
 
 @restricted
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -392,8 +452,12 @@ def main():
     application = ApplicationBuilder().token(token).build()
     job_queue = application.job_queue
 
-    # A single job now runs both analysis and monitoring
-    job_queue.run_repeating(run_analysis_and_monitoring, interval=60, first=10, data={"chat_ids": ALLOWED_CHAT_IDS})
+    # --- Новые задачи ---
+    # 1. Задача обновления списка наблюдения (каждые 4 часа)
+    job_queue.run_repeating(update_watchlist_job, interval=timedelta(hours=4), first=10, data={"chat_ids": ALLOWED_CHAT_IDS})
+    
+    # 2. Основная задача анализа и мониторинга (каждую минуту)
+    job_queue.run_repeating(run_analysis_and_monitoring, interval=60, first=20, data={"chat_ids": ALLOWED_CHAT_IDS})
 
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('risk', risk))
@@ -404,6 +468,9 @@ def main():
     application.add_handler(CommandHandler('stats', stats))
     application.add_handler(CommandHandler('winrate', winrate))
     application.add_handler(CommandHandler('get_csv', get_csv))
+    # Новая команда для просмотра списка
+    application.add_handler(CommandHandler('watchlist', get_watchlist))
+
 
     print("Bot is running... Press Ctrl-C to stop.")
     application.run_polling()
