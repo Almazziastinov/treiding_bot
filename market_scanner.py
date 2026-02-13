@@ -10,7 +10,7 @@ logging.basicConfig(
 scanner_logger = logging.getLogger(__name__)
 
 
-def get_klines(symbol, timeframe='4h', limit=1=10):
+def get_klines(symbol, timeframe='4h', limit=10):
     """
     Запрашивает K-линии (свечи) для указанного символа.
     """
